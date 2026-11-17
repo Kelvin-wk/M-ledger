@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "m-ledger": {
+      "url": "http://127.0.0.1:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_LOCAL_TOKEN"
+      }
+    }
+  }
+}

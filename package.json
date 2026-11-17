@@ -1,0 +1,35 @@
+{
+  "name": "m-ledger-mcp-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M-Ledger MCP App: sandbox cross-border settlement ledger for East African businesses",
+  "scripts": {
+    "build": "tsc --noEmit && cross-env INPUT=mcp-app.html vite build && npm run compile:contracts",
+    "compile:contracts": "tsx scripts/compile-contracts.ts",
+    "start": "tsx main.ts",
+    "dev": "concurrently --raw \"cross-env NODE_ENV=development INPUT=mcp-app.html vite build --watch\" \"tsx watch main.ts\"",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/express": "^2.0.0",
+    "@modelcontextprotocol/ext-apps": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^5.1.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.30",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "solc": "^0.8.30",
+    "tsx": "^4.20.6",
+    "typescript": "^6.0.0",
+    "vite": "^7.1.12",
+    "vite-plugin-singlefile": "^2.3.0"
+  }
+}
