@@ -1,4 +1,28 @@
 import { App } from '@modelcontextprotocol/ext-apps';
+import authBgUrl from './assets/images/auth_emerald_skyline_1794924136873.jpg';
+import {
+  auth,
+  collection,
+  db,
+  doc,
+  getDoc,
+  getDocs,
+  googleProvider,
+  handleFirestoreError,
+  onAuthStateChanged,
+  onSnapshot,
+  OperationType,
+  query,
+  serverTimestamp,
+  setDoc,
+  signInWithPopup,
+  signOut,
+  updateDoc,
+  where,
+  writeBatch,
+  type Unsubscribe,
+  type User,
+} from './firebase';
 import './style.css';
 
 type Currency = 'KES' | 'USD' | 'USDC';
@@ -25,6 +49,7 @@ type Settlement = {
   createdAt: string;
   note: string;
   confirmationToken?: string;
+  attestationHash?: string;
 };
 type Data = {
   summary: {
@@ -53,7 +78,7 @@ type Page =
   | 'counterparties'
   | 'api'
   | 'settings';
-type Beneficiary = { name: string; country: string; rail: string; destination: string };
+type Beneficiary = { id?: string; name: string; country: string; rail: string; destination: string };
 
 const app = new App({ name: 'M-Ledger Workspace', version: '0.1.0' });
 const root = document.querySelector<HTMLDivElement>('#app')!;
@@ -85,37 +110,10 @@ const sample: Data = {
   settlements: [],
 };
 
-let storageWarning = '';
-function readLocalData(): Data {
-  try {
-    const stored = localStorage.getItem('mledger.preview-ledger');
-    if (!stored) return structuredClone(sample);
-    const parsed: unknown = JSON.parse(stored);
-    if (
-      typeof parsed === 'object'
-      && parsed !== null
-      && 'invoices' in parsed
-      && 'settlements' in parsed
-      && Array.isArray(parsed.invoices)
-      && Array.isArray(parsed.settlements)
-    ) {
-      return parsed as Data;
-    }
-    if (stored) {
-      localStorage.removeItem('mledger.preview-ledger');
-      storageWarning = 'Saved preview data was invalid and has been reset to the sample ledger.';
-    }
-  } catch (error) {
-    storageWarning = error instanceof Error
-      ? `Saved preview data could not be loaded: ${error.message}`
-      : 'Saved preview data could not be loaded.';
-  }
-  return structuredClone(sample);
-}
-
-let data: Data = readLocalData();
+let data: Data = structuredClone(sample);
+let cloudBeneficiaries: Beneficiary[] = [];
 let busy = false;
-let notice = storageWarning;
+let notice = '';
 let activePage: Page = 'dashboard';
 let connection: 'connected' | 'preview' | 'offline' = 'preview';
 let invoiceSearch = '';
@@ -123,6 +121,16 @@ let invoiceStatus = 'all';
 let settlementStatus = 'all';
 let dashboardRange = '30';
 let conversionResult = '';
+
+let authReady = false;
+let authBusy = false;
+let authError = '';
+let currentUser: User | null = null;
+let backendVerified = false;
+let userOrganization = localStorage.getItem('mledger.org') || 'Acme Imports Ltd';
+let userNotifications = localStorage.getItem('mledger.notifications') !== 'false';
+let unsubscribers: Unsubscribe[] = [];
+
 const money = (amount: number, currency: Currency | string) => {
   const iso = currency === 'USDC' ? 'USD' : currency;
   const formatted = new Intl.NumberFormat('en-KE', {
@@ -149,7 +157,15 @@ const parseResult = (result: any): any => {
   try { return typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return null; }
 };
 
-function recalculateLocalSummary() {
+function toIsoDate(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && 'toDate' in value && typeof (value as { toDate: () => Date }).toDate === 'function') {
+    return (value as { toDate: () => Date }).toDate().toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function recalculateSummary() {
   const remaining = (invoice: Invoice) => invoice.amount - data.settlements
     .filter(item => item.invoiceId === invoice.id && item.status === 'completed')
     .reduce((sum, item) => sum + item.amount, 0);
@@ -166,15 +182,228 @@ function recalculateLocalSummary() {
     sandbox: true,
   };
 }
-function saveLocalData() {
-  recalculateLocalSummary();
-  localStorage.setItem('mledger.preview-ledger', JSON.stringify(data));
-}
+
 function validCurrency(value: unknown): value is Currency {
   return value === 'KES' || value === 'USD' || value === 'USDC';
 }
-function localTool(name: string, args: Record<string, unknown>) {
+
+function clearFirestoreListeners() {
+  for (const unsub of unsubscribers) unsub();
+  unsubscribers = [];
+}
+
+async function securedBackendFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  if (!currentUser) throw new Error('Authentication required.');
+  const idToken = await currentUser.getIdToken();
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${idToken}`,
+      ...(options.headers ?? {}),
+    },
+  });
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new Error(typeof body.error === 'string' ? body.error : `Security check failed (${response.status}).`);
+  }
+  return body as T;
+}
+
+async function writeAuditLog(uid: string, action: string, targetId: string, attestationHash: string) {
+  const logId = crypto.randomUUID();
+  const logPath = `users/${uid}/auditLogs/${logId}`;
+  try {
+    await setDoc(doc(db, 'users', uid, 'auditLogs', logId), {
+      ownerId: uid,
+      action: action.slice(0, 60),
+      targetId,
+      attestationHash,
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, logPath);
+  }
+}
+
+async function ensureUserWorkspace(user: User) {
+  const uid = user.uid;
+  const userPath = `users/${uid}`;
+  try {
+    const snap = await getDoc(doc(db, 'users', uid));
+    if (!snap.exists()) {
+      const defaultOrg = (localStorage.getItem('mledger.org') || user.displayName || 'Acme Imports Ltd').slice(0, 80);
+      await setDoc(doc(db, 'users', uid), {
+        uid,
+        email: user.email ?? '',
+        organization: defaultOrg,
+        notificationsEnabled: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      userOrganization = defaultOrg;
+      userNotifications = true;
+    } else {
+      const profile = snap.data();
+      if (typeof profile.organization === 'string' && profile.organization) {
+        userOrganization = profile.organization;
+        localStorage.setItem('mledger.org', profile.organization);
+      }
+      if (typeof profile.notificationsEnabled === 'boolean') {
+        userNotifications = profile.notificationsEnabled;
+        localStorage.setItem('mledger.notifications', String(profile.notificationsEnabled));
+      }
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, userPath);
+  }
+
+  // Seed starter sandbox invoices on first login if collection is empty
+  const invoicesColPath = `users/${uid}/invoices`;
+  try {
+    const existingSnap = await getDocs(query(collection(db, 'users', uid, 'invoices'), where('ownerId', '==', uid)));
+    if (existingSnap.empty) {
+      const batch = writeBatch(db);
+      for (const item of sample.invoices) {
+        batch.set(doc(db, 'users', uid, 'invoices', item.id), {
+          ownerId: uid,
+          reference: item.reference,
+          customer: item.customer,
+          description: item.description,
+          amount: item.amount,
+          currency: item.currency,
+          dueDate: item.dueDate,
+          status: item.status,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      await batch.commit();
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, invoicesColPath);
+  }
+}
+
+function startFirestoreSync(uid: string) {
+  clearFirestoreListeners();
+
+  const profilePath = `users/${uid}`;
+  unsubscribers.push(
+    onSnapshot(
+      doc(db, 'users', uid),
+      snapshot => {
+        const profile = snapshot.data();
+        if (profile) {
+          if (typeof profile.organization === 'string' && profile.organization) {
+            userOrganization = profile.organization;
+            localStorage.setItem('mledger.org', profile.organization);
+          }
+          if (typeof profile.notificationsEnabled === 'boolean') {
+            userNotifications = profile.notificationsEnabled;
+            localStorage.setItem('mledger.notifications', String(profile.notificationsEnabled));
+          }
+          if (!root.querySelector('#modal-backdrop')) render();
+        }
+      },
+      error => {
+        handleFirestoreError(error, OperationType.GET, profilePath);
+      },
+    ),
+  );
+
+  const invoicesPath = `users/${uid}/invoices`;
+  unsubscribers.push(
+    onSnapshot(
+      query(collection(db, 'users', uid, 'invoices'), where('ownerId', '==', uid)),
+      snapshot => {
+        data.invoices = snapshot.docs
+          .map(entry => {
+            const raw = entry.data();
+            return {
+              id: entry.id,
+              reference: String(raw.reference ?? ''),
+              customer: String(raw.customer ?? ''),
+              description: String(raw.description ?? ''),
+              amount: Number(raw.amount ?? 0),
+              currency: (validCurrency(raw.currency) ? raw.currency : 'KES') as Currency,
+              dueDate: String(raw.dueDate ?? ''),
+              status: String(raw.status ?? 'open'),
+              createdAt: toIsoDate(raw.createdAt),
+            };
+          })
+          .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''));
+        recalculateSummary();
+        if (!root.querySelector('#modal-backdrop')) render();
+      },
+      error => {
+        handleFirestoreError(error, OperationType.LIST, invoicesPath);
+      },
+    ),
+  );
+
+  const settlementsPath = `users/${uid}/settlements`;
+  unsubscribers.push(
+    onSnapshot(
+      query(collection(db, 'users', uid, 'settlements'), where('ownerId', '==', uid)),
+      snapshot => {
+        data.settlements = snapshot.docs
+          .map(entry => {
+            const raw = entry.data();
+            return {
+              id: entry.id,
+              invoiceId: String(raw.invoiceId ?? ''),
+              amount: Number(raw.amount ?? 0),
+              sourceCurrency: (validCurrency(raw.sourceCurrency) ? raw.sourceCurrency : 'KES') as Currency,
+              destinationCurrency: (validCurrency(raw.destinationCurrency) ? raw.destinationCurrency : 'KES') as Currency,
+              destination: String(raw.destination ?? ''),
+              rail: String(raw.rail ?? 'mpesa_sandbox'),
+              status: String(raw.status ?? 'pending_confirmation'),
+              createdAt: toIsoDate(raw.createdAt),
+              note: String(raw.note ?? 'Sandbox only. No funds have moved.'),
+              confirmationToken: typeof raw.confirmationToken === 'string' ? raw.confirmationToken : undefined,
+              attestationHash: typeof raw.attestationHash === 'string' ? raw.attestationHash : undefined,
+            };
+          })
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        recalculateSummary();
+        if (!root.querySelector('#modal-backdrop')) render();
+      },
+      error => {
+        handleFirestoreError(error, OperationType.LIST, settlementsPath);
+      },
+    ),
+  );
+
+  const beneficiariesPath = `users/${uid}/beneficiaries`;
+  unsubscribers.push(
+    onSnapshot(
+      query(collection(db, 'users', uid, 'beneficiaries'), where('ownerId', '==', uid)),
+      snapshot => {
+        cloudBeneficiaries = snapshot.docs.map(entry => {
+          const raw = entry.data();
+          return {
+            id: entry.id,
+            name: String(raw.name ?? ''),
+            country: String(raw.country ?? ''),
+            rail: String(raw.rail ?? ''),
+            destination: String(raw.destination ?? ''),
+          };
+        });
+        if (!root.querySelector('#modal-backdrop')) render();
+      },
+      error => {
+        handleFirestoreError(error, OperationType.LIST, beneficiariesPath);
+      },
+    ),
+  );
+}
+
+async function firestoreTool(name: string, args: Record<string, unknown>) {
+  if (!currentUser) throw new Error('Please sign in to access the M-Ledger workspace.');
+  const uid = currentUser.uid;
   let result: Record<string, any>;
+
   if (name === 'mledger_create_invoice') {
     const reference = String(args.reference ?? '').trim();
     const customer = String(args.customer ?? '').trim();
@@ -189,12 +418,30 @@ function localTool(name: string, args: Record<string, unknown>) {
     if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000) throw new Error('Amount must be greater than zero and within the supported limit.');
     if (!validCurrency(currency)) throw new Error('Choose a supported currency.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(Date.parse(`${dueDate}T00:00:00`))) throw new Error('Choose a valid due date.');
+
+    const invoiceId = crypto.randomUUID();
+    const invoicePath = `users/${uid}/invoices/${invoiceId}`;
+    try {
+      await setDoc(doc(db, 'users', uid, 'invoices', invoiceId), {
+        ownerId: uid,
+        reference,
+        customer,
+        description,
+        amount,
+        currency,
+        dueDate,
+        status: 'open',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, invoicePath);
+    }
     const invoice: Invoice = {
-      id: crypto.randomUUID(), reference, customer, description, amount, currency, dueDate,
+      id: invoiceId, reference, customer, description, amount, currency, dueDate,
       status: 'open', createdAt: new Date().toISOString(),
     };
-    data.invoices.unshift(invoice);
-    saveLocalData();
+    await writeAuditLog(uid, 'invoice_created', invoiceId, `inv_${invoiceId.replaceAll('-', '')}`);
     result = { invoice, sandbox: true };
   } else if (name === 'mledger_request_settlement') {
     const invoice = data.invoices.find(item => item.id === args.invoiceId);
@@ -212,21 +459,64 @@ function localTool(name: string, args: Record<string, unknown>) {
       stablecoin_sandbox: 'Stablecoin sandbox',
     };
     if (typeof args.rail !== 'string' || !rails[args.rail]) throw new Error('Choose a supported sandbox settlement rail.');
+    const destinationCurrency = validCurrency(args.destinationCurrency) ? args.destinationCurrency : 'KES';
+    const idempotencyKey = String(args.idempotencyKey ?? `ui-${crypto.randomUUID()}`);
+
+    const attested = await securedBackendFetch<{
+      confirmationToken: string;
+      attestationHash: string;
+    }>('/api/security/attest-settlement', {
+      method: 'POST',
+      body: JSON.stringify({
+        invoiceId: invoice.id,
+        amount: Math.round(amount * 100) / 100,
+        sourceCurrency: invoice.currency,
+        destinationCurrency,
+        destination,
+        rail: args.rail,
+        idempotencyKey,
+      }),
+    });
+
+    const settlementId = crypto.randomUUID();
+    const settlementPath = `users/${uid}/settlements/${settlementId}`;
+    const note = 'Sandbox only. No funds have moved.';
+    try {
+      await setDoc(doc(db, 'users', uid, 'settlements', settlementId), {
+        ownerId: uid,
+        invoiceId: invoice.id,
+        amount: Math.round(amount * 100) / 100,
+        sourceCurrency: invoice.currency,
+        destinationCurrency,
+        destination,
+        rail: args.rail,
+        status: 'pending_confirmation',
+        idempotencyKey,
+        note,
+        confirmationToken: attested.confirmationToken,
+        attestationHash: attested.attestationHash,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, settlementPath);
+    }
+
+    await writeAuditLog(uid, 'settlement_requested', settlementId, attested.attestationHash);
     const settlement: Settlement = {
-      id: crypto.randomUUID(),
+      id: settlementId,
       invoiceId: invoice.id,
       amount: Math.round(amount * 100) / 100,
       sourceCurrency: invoice.currency,
-      destinationCurrency: validCurrency(args.destinationCurrency) ? args.destinationCurrency : 'KES',
+      destinationCurrency,
       destination,
       rail: args.rail,
       status: 'pending_confirmation',
       createdAt: new Date().toISOString(),
-      note: 'Sandbox only. No funds have moved.',
-      confirmationToken: crypto.randomUUID(),
+      note,
+      confirmationToken: attested.confirmationToken,
+      attestationHash: attested.attestationHash,
     };
-    data.settlements.unshift(settlement);
-    saveLocalData();
     result = { settlement, sandbox: true };
   } else if (name === 'mledger_get_confirmation_challenge') {
     const settlement = data.settlements.find(item => item.id === args.settlementId && item.status === 'pending_confirmation');
@@ -241,16 +531,52 @@ function localTool(name: string, args: Record<string, unknown>) {
       if (settlement.status !== 'pending_confirmation') throw new Error('Settlement is no longer pending confirmation.');
       if (args.confirmed !== true) throw new Error('Explicit confirmation is required.');
       if (!settlement.confirmationToken || args.confirmationToken !== settlement.confirmationToken) throw new Error('Invalid settlement confirmation token.');
-      settlement.status = 'completed';
-      settlement.note = 'Sandbox settlement completed. This is a simulated ledger entry; no funds moved.';
-      const invoice = data.invoices.find(item => item.id === settlement.invoiceId);
-      if (invoice) {
-        const total = data.settlements.filter(item => item.invoiceId === invoice.id && item.status === 'completed')
-          .reduce((sum, item) => sum + item.amount, 0);
-        invoice.status = total >= invoice.amount ? 'settled' : 'partially_settled';
+
+      const verified = await securedBackendFetch<{ attestationHash: string }>('/api/security/verify-confirmation', {
+        method: 'POST',
+        body: JSON.stringify({
+          settlementId: settlement.id,
+          invoiceId: settlement.invoiceId,
+          confirmationToken: settlement.confirmationToken,
+          confirmed: true,
+        }),
+      });
+
+      const completionNote = 'Sandbox settlement completed. This is a simulated ledger entry; no funds moved.';
+      const settlementPath = `users/${uid}/settlements/${settlement.id}`;
+      try {
+        await updateDoc(doc(db, 'users', uid, 'settlements', settlement.id), {
+          status: 'completed',
+          note: completionNote,
+          attestationHash: verified.attestationHash,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, settlementPath);
       }
-      saveLocalData();
-      result = { settlement, sandbox: true };
+
+      const invoice = data.invoices.find(item => item.id === settlement.invoiceId);
+      if (invoice && invoice.status !== 'settled') {
+        const total = data.settlements
+          .filter(item => item.invoiceId === invoice.id && (item.status === 'completed' || item.id === settlement.id))
+          .reduce((sum, item) => sum + item.amount, 0);
+        const nextStatus = total >= invoice.amount ? 'settled' : 'partially_settled';
+        const invoicePath = `users/${uid}/invoices/${invoice.id}`;
+        try {
+          await updateDoc(doc(db, 'users', uid, 'invoices', invoice.id), {
+            status: nextStatus,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.UPDATE, invoicePath);
+        }
+      }
+
+      await writeAuditLog(uid, 'settlement_confirmed', settlement.id, verified.attestationHash);
+      result = {
+        settlement: { ...settlement, status: 'completed', note: completionNote, attestationHash: verified.attestationHash },
+        sandbox: true,
+      };
     }
   } else if (name === 'mledger_estimate_fx') {
     const amount = Number(args.amount);
@@ -258,19 +584,12 @@ function localTool(name: string, args: Record<string, unknown>) {
     const to = args.to;
     if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000) throw new Error('Amount must be positive and within the supported limit.');
     if (!validCurrency(from) || !validCurrency(to)) throw new Error('Choose supported currencies.');
-    const kesPerUsd = 129.5;
-    const usd = from === 'KES' ? amount / kesPerUsd : amount;
-    const outputAmount = to === 'KES' ? usd * kesPerUsd : usd;
-    result = {
-      inputAmount: Math.round(amount * 100) / 100,
-      from,
-      outputAmount: Math.round(outputAmount * 100) / 100,
-      to,
-      rateLabel: 'Illustrative demo rate · not executable',
-      disclaimer: 'Indicative only. Confirm live rates and fees with your regulated provider.',
-    };
+    result = await securedBackendFetch<Record<string, any>>('/api/security/fx-quote', {
+      method: 'POST',
+      body: JSON.stringify({ amount, from, to }),
+    });
   } else {
-    throw new Error(`The ${name} operation is unavailable in the static preview.`);
+    throw new Error(`The ${name} operation is unavailable.`);
   }
   return {
     structuredContent: result,
@@ -285,7 +604,7 @@ async function refresh() {
     const next = parseResult(response);
     if (next?.summary && Array.isArray(next.invoices) && Array.isArray(next.settlements)) data = next as Data;
   } catch {
-    // The local preview intentionally uses sample data when no MCP host is connected.
+    // Fallback to Firestore live data when no MCP host is connected.
   }
 }
 
@@ -298,7 +617,7 @@ async function callTool(name: string, args: Record<string, unknown> = {}) {
   try {
     const response = connection === 'connected'
       ? await app.callServerTool({ name, arguments: args })
-      : localTool(name, args);
+      : await firestoreTool(name, args);
     const parsed = parseResult(response);
     if (!parsed) throw new Error('The server returned an unreadable response.');
     if (parsed.error) {
@@ -317,7 +636,16 @@ async function callTool(name: string, args: Record<string, unknown> = {}) {
     await refresh();
     return parsed;
   } catch (error) {
-    notice = error instanceof Error ? error.message : 'The server could not complete this request. Try again.';
+    if (error instanceof Error) {
+      try {
+        const parsedErr = JSON.parse(error.message) as { error?: string };
+        notice = parsedErr.error ?? error.message;
+      } catch {
+        notice = error.message;
+      }
+    } else {
+      notice = 'The server could not complete this request. Try again.';
+    }
     return null;
   } finally {
     busy = false;
@@ -347,8 +675,47 @@ function button(label: string, action: string, secondary = false) {
 function panelHeader(title: string, description: string, action = '') {
   return `<div class="panel-head"><div><h3>${safe(title)}</h3><p>${safe(description)}</p></div>${action}</div>`;
 }
+
+function authPage() {
+  return `<div class="auth-page">
+    <img class="auth-bg" src="${authBgUrl}" alt="East African financial skyline at twilight" referrerpolicy="no-referrer" />
+    <div class="auth-scrim" aria-hidden="true"></div>
+    <section class="auth-card" aria-labelledby="auth-title">
+      <div class="auth-brand">
+        <span class="brand-mark">M</span>
+        <div><b>M-LEDGER</b><small>Cross-border Settlements · East Africa</small></div>
+      </div>
+      <h1 id="auth-title">Sign in to your workspace</h1>
+      <p class="auth-sub">Access your invoice ledger, indicative KES/USD/USDC desk, and verified sandbox settlement workflows.</p>
+      <div class="auth-features">
+        <div class="auth-feature"><span class="auth-feature-dot">✓</span><span>Firebase Authentication &amp; session verification</span></div>
+        <div class="auth-feature"><span class="auth-feature-dot">✓</span><span>Tenant-isolated Cloud Firestore ledger persistence</span></div>
+        <div class="auth-feature"><span class="auth-feature-dot">✓</span><span>Backend SHA-256 settlement attestation checks</span></div>
+      </div>
+      ${authError ? `<div class="auth-error" role="alert">${safe(authError)}</div>` : ''}
+      <button class="auth-google-btn" id="google-signin-btn" type="button" ${authBusy ? 'disabled' : ''}>
+        <span class="auth-google-badge" aria-hidden="true">
+          <svg width="13" height="13" viewBox="0 0 24 24">
+            <path fill="#4285F4" d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.5c-.3 1.5-1.1 2.8-2.4 3.6v3h3.9c2.3-2.1 3.5-5.2 3.5-8.7z"/>
+            <path fill="#34A853" d="M12 24c3.2 0 6-1.1 8-2.9l-3.9-3c-1.1.7-2.5 1.2-4.1 1.2-3.2 0-5.9-2.1-6.9-5H1.1v3.1C3.1 21.3 7.2 24 12 24z"/>
+            <path fill="#FBBC05" d="M5.1 14.3c-.2-.7-.4-1.5-.4-2.3s.2-1.6.4-2.3V6.6H1.1C.4 8.2 0 10.1 0 12s.4 3.8 1.1 5.4l4-3.1z"/>
+            <path fill="#EA4335" d="M12 4.8c1.8 0 3.3.6 4.6 1.8l3.4-3.4C17.9 1.2 15.2 0 12 0 7.2 0 3.1 2.7 1.1 6.6l4 3.1c1-2.9 3.7-4.9 6.9-4.9z"/>
+          </svg>
+        </span>
+        <span>${authBusy ? 'Signing in with Google…' : 'Continue with Google'}</span>
+      </button>
+      <div class="auth-footer">
+        <span>Secured by Firebase &amp; M-Ledger Backend</span>
+        <span>Sandbox mode</span>
+      </div>
+    </section>
+  </div>`;
+}
+
 function shell(content: string) {
-  const initials = safe((localStorage.getItem('mledger.org') || 'Acme Imports').split(/\s+/).slice(0, 2).map(part => part[0]).join('').toUpperCase());
+  const orgName = userOrganization || 'Acme Imports Ltd';
+  const emailLabel = currentUser?.email || 'admin@acme.co.ke';
+  const initials = safe(orgName.split(/\s+/).slice(0, 2).map(part => part[0]).join('').toUpperCase() || 'ML');
   return `<div class="layout">
     <aside class="sidebar">
       <a class="brand" href="#" data-page="dashboard" aria-label="M-Ledger dashboard">
@@ -359,7 +726,7 @@ function shell(content: string) {
       </nav>
       <div class="wallet-card"><small>SANDBOX WALLET · ILLUSTRATIVE</small><span class="wallet-currency">◉ USDC</span><strong>${money(12450, 'USDC')}</strong><span>≈ ${money(1612275, 'KES')} · demo</span></div>
       <div class="sidebar-bottom">
-        <div class="profile"><span class="profile-avatar">${initials}</span><span><b>${safe(localStorage.getItem('mledger.org') || 'Acme Imports Ltd')}</b><small>admin@acme.co.ke</small></span><button aria-label="Open settings" data-page="settings">⌄</button></div>
+        <div class="profile"><span class="profile-avatar">${initials}</span><span><b>${safe(orgName)}</b><small>${safe(emailLabel)}</small></span><button aria-label="Open settings" data-page="settings">⌄</button></div>
       </div>
     </aside>
     <main class="main">
@@ -368,7 +735,7 @@ function shell(content: string) {
         <div class="top-actions">
           <span class="sandbox-label">Sandbox Mode <i class="toggle-on"></i></span>
           <button class="icon-button notification-button" aria-label="Notifications" data-action="notifications">♧<i></i></button>
-          <button class="workspace-button" data-page="settings">${safe(localStorage.getItem('mledger.org') || 'Acme Imports Ltd')} <span>⌄</span></button>
+          <button class="workspace-button" data-page="settings">${safe(orgName)} <span>⌄</span></button>
         </div>
       </header>
       <div class="content">
@@ -393,7 +760,7 @@ function invoiceRows(invoices: Invoice[]) {
     <td><b>${safe(invoice.reference)}</b><small>${safe(invoice.description)}</small></td>
     <td>${safe(invoice.customer)}</td><td class="amount">${money(invoice.amount, invoice.currency)}</td>
     <td>${shortDate(invoice.dueDate)}</td><td>${badge(invoice.status)}</td>
-    <td><button class="text-action" data-settle="${safe(invoice.id)}" ${connection === 'connected' && invoice.id.startsWith('demo-') || invoiceBalance(invoice) <= 0 ? 'disabled title="This invoice has no available settlement balance"' : ''}>Request payout →</button></td>
+    <td><button class="text-action" data-settle="${safe(invoice.id)}" ${(connection === 'connected' && invoice.id.startsWith('demo-')) || invoiceBalance(invoice) <= 0 ? 'disabled title="This invoice has no available settlement balance"' : ''}>Request payout →</button></td>
   </tr>`).join('');
 }
 function invoiceTable(invoices: Invoice[], includeFilters = false) {
@@ -520,7 +887,7 @@ function quickTools() {
   </article>`;
 }
 function dashboardPage() {
-  const greetingName = (localStorage.getItem('mledger.org') || 'Acme Imports').split(' ')[0];
+  const greetingName = (userOrganization || currentUser?.displayName || 'Acme Imports').split(' ')[0];
   return `<div class="dashboard-welcome"><div><h2>Good morning, ${safe(greetingName)}! <span>👋</span></h2><p>Here’s what’s happening with your settlements today.</p></div>
     <select class="date-filter" id="dashboard-range" aria-label="Dashboard date range"><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="all">All time</option></select></div>
     <section class="metrics" aria-label="Key metrics">
@@ -574,23 +941,15 @@ function settlementsPage(payouts = false) {
   </section>`;
 }
 
-function getBeneficiaries(): Beneficiary[] {
-  try {
-    const saved: unknown = JSON.parse(localStorage.getItem('mledger.beneficiaries') ?? '[]');
-    return Array.isArray(saved) ? saved as Beneficiary[] : [];
-  } catch {
-    return [];
-  }
-}
 function beneficiariesPage() {
-  const stored = getBeneficiaries();
+  const stored = cloudBeneficiaries;
   const derived = [...new Set(data.invoices.map(item => item.customer))].map(name => ({
     name, country: 'East Africa', rail: 'Not set', destination: 'Add payout details to enable a payout',
   }));
   const records = [...stored, ...derived.filter(item => !stored.some(saved => saved.name === item.name))];
   return `<section class="panel">${panelHeader('Beneficiary directory', `${records.length} saved or invoice-linked counterparties`, '<button class="primary small" data-action="new-beneficiary">＋ Add beneficiary</button>')}
     ${records.length ? `<div class="beneficiary-grid">${records.map((item, index) => `<article class="beneficiary-card"><span class="beneficiary-avatar">${safe(item.name.slice(0, 1).toUpperCase())}</span><div class="beneficiary-info"><h3>${safe(item.name)}</h3><p>${safe(item.country)} · ${safe(item.rail)}</p><small>${safe(item.destination)}</small></div>${index < stored.length ? '<span class="status completed">SAVED</span>' : '<span class="status">INVOICE LINKED</span>'}</article>`).join('')}</div>` : '<div class="empty-inline">Add your first beneficiary to keep payout details organized.</div>'}
-  </section><div class="notice info-notice">Beneficiaries are stored locally in this browser preview. Saved details do not initiate payments.</div>`;
+  </section><div class="notice info-notice">Beneficiaries are stored securely in your private Cloud Firestore workspace. Saved details do not initiate payments.</div>`;
 }
 function accountsPage() {
   const currencies: Currency[] = ['KES', 'USD', 'USDC'];
@@ -637,23 +996,28 @@ function apiPage() {
   const endpoint = `${location.origin}/mcp`;
   const tools = ['mledger_dashboard', 'mledger_list_invoices', 'mledger_create_invoice', 'mledger_estimate_fx', 'mledger_request_settlement', 'mledger_list_settlements'];
   return `<div class="page-intro"><h2>API & MCP</h2><p>Connect an MCP-compatible host to the sandbox settlement workspace.</p></div>
-    <section class="panel">${panelHeader('MCP endpoint', 'Streamable HTTP · local sandbox', '<button class="secondary small" data-copy="${safe(endpoint)}">Copy URL</button>')}
-      <div class="code-block">${safe(endpoint)}</div><div class="api-meta"><span>Connection <b class="${connection === 'connected' ? 'text-green' : ''}">${connection === 'connected' ? 'Connected to MCP host' : connection === 'preview' ? 'Static preview · actions stay in this browser' : 'Disconnected'}</b></span><span>${connection === 'connected' ? `Health check <code>${safe(location.origin)}/health</code>` : 'A separately hosted backend is required for MCP tools.'}</span></div>
+    <section class="panel">${panelHeader('MCP endpoint', 'Streamable HTTP · sandbox backend', '<button class="secondary small" data-copy="${safe(endpoint)}">Copy URL</button>')}
+      <div class="code-block">${safe(endpoint)}</div><div class="api-meta"><span>Security <b class="text-green">${backendVerified ? 'Firebase JWT verified by backend' : 'Firebase Auth active'}</b></span><span>Health check <code>${safe(location.origin)}/health</code></span></div>
     </section>
     <section class="panel">${panelHeader('Available MCP tools', 'Read and write operations when opened in an MCP host')}
       <div class="tool-list">${tools.map(tool => `<div><code>${tool}</code><span>${tool.includes('create') || tool.includes('request') ? 'Sandbox write' : 'Read / estimate'}</span></div>`).join('')}</div>
-      <div class="notice info-notice">${connection === 'connected' ? 'Settlement confirmation is gated in the app UI and updates only the sandbox ledger. This server cannot transfer money.' : 'Static preview actions are stored in this browser only. They are not sent to an MCP server and cannot transfer money.'}</div>
+      <div class="notice info-notice">Settlement requests and confirmations are attested by the backend security API and persisted to your isolated Cloud Firestore ledger.</div>
     </section>`;
 }
 function settingsPage() {
-  const organization = safe(localStorage.getItem('mledger.org') || 'Acme Imports Ltd');
-  const notifications = localStorage.getItem('mledger.notifications') !== 'false';
-  return `<section class="panel settings-panel">${panelHeader('Workspace settings', 'Manage local preview preferences')}
+  const organization = safe(userOrganization || 'Acme Imports Ltd');
+  return `<section class="panel settings-panel">${panelHeader('Workspace settings', 'Manage your authenticated workspace preferences')}
     <form id="settings-form" class="settings-form"><label>Organization name<input name="organization" value="${organization}" maxlength="80" required></label>
-      <label class="setting-switch"><span><b>Settlement notifications</b><small>Show local activity notices in this workspace.</small></span><input name="notifications" type="checkbox" ${notifications ? 'checked' : ''}></label>
-      <div class="setting-readonly"><span>Workspace mode</span><b>Sandbox · no real funds</b></div>      <div class="setting-readonly"><span>Data storage</span><b>${connection === 'connected' ? 'In-memory MCP server' : 'Browser local storage · this device'}</b></div>
-      <button class="primary" type="submit">Save settings</button></form>
-  </section><div class="notice info-notice">Organization name and notification preference are saved in this browser only. Payment provider credentials are not configured here.</div>`;
+      <label class="setting-switch"><span><b>Settlement notifications</b><small>Show local activity notices in this workspace.</small></span><input name="notifications" type="checkbox" ${userNotifications ? 'checked' : ''}></label>
+      <div class="setting-readonly"><span>Signed-in account</span><b>${safe(currentUser?.email ?? '—')}</b></div>
+      <div class="setting-readonly"><span>Workspace mode</span><b>Sandbox · no real funds</b></div>
+      <div class="setting-readonly"><span>Data storage</span><b>Cloud Firestore · Firebase Auth secured</b></div>
+      <div class="settings-actions">
+        <button class="primary" type="submit">Save settings</button>
+        <button class="danger-outline" type="button" id="signout-btn">Sign out</button>
+      </div>
+    </form>
+  </section><div class="notice info-notice">Your workspace profile and ledger data are isolated by Firebase Authentication UID and enforced by Firestore security rules.</div>`;
 }
 
 function contentForPage() {
@@ -708,12 +1072,12 @@ function bindModalForms() {
       render();
     }
   });
-  root.querySelector<HTMLFormElement>('#beneficiary-form')?.addEventListener('submit', event => {
+  root.querySelector<HTMLFormElement>('#beneficiary-form')?.addEventListener('submit', async event => {
     event.preventDefault();
+    if (!currentUser) return;
     const formData = new FormData(event.currentTarget as HTMLFormElement);
     const beneficiary = Object.fromEntries(formData) as Beneficiary;
-    const beneficiaries = getBeneficiaries();
-    if (beneficiaries.some(item => item.name.toLowerCase() === beneficiary.name.toLowerCase())) {
+    if (cloudBeneficiaries.some(item => item.name.toLowerCase() === beneficiary.name.toLowerCase())) {
       let message = root.querySelector<HTMLElement>('.modal-notice');
       if (!message) {
         message = document.createElement('div');
@@ -724,11 +1088,24 @@ function bindModalForms() {
       if (message) message.textContent = 'A beneficiary with this name is already saved.';
       return;
     }
-    beneficiaries.unshift(beneficiary);
-    localStorage.setItem('mledger.beneficiaries', JSON.stringify(beneficiaries));
-    closeModal();
-    notice = 'Beneficiary saved locally.';
-    render();
+    const uid = currentUser.uid;
+    const beneficiaryId = crypto.randomUUID();
+    const beneficiaryPath = `users/${uid}/beneficiaries/${beneficiaryId}`;
+    try {
+      await setDoc(doc(db, 'users', uid, 'beneficiaries', beneficiaryId), {
+        ownerId: uid,
+        name: beneficiary.name.trim(),
+        country: beneficiary.country.trim(),
+        rail: beneficiary.rail,
+        destination: beneficiary.destination.trim(),
+        createdAt: serverTimestamp(),
+      });
+      closeModal();
+      notice = 'Beneficiary saved to Cloud Firestore.';
+      render();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, beneficiaryPath);
+    }
   });
 }
 function openInvoiceModal() {
@@ -756,7 +1133,7 @@ function openSettlementModal(invoice: Invoice) {
     </form>`);
 }
 function openBeneficiaryModal() {
-  modal(`<p class="eyebrow">DIRECTORY</p><h3 id="modal-title">Add beneficiary</h3><p class="sub">Save recipient details locally for reference. This does not enable or initiate a payout.</p>
+  modal(`<p class="eyebrow">DIRECTORY</p><h3 id="modal-title">Add beneficiary</h3><p class="sub">Save recipient details for reference. This does not enable or initiate a payout.</p>
     <form id="beneficiary-form"><label>Business / recipient name<input name="name" required minlength="2" maxlength="100"></label>
       <label>Country<input name="country" placeholder="Kenya" required maxlength="80"></label>
       <label>Payout method<select name="rail"><option>M-Pesa</option><option>Bank transfer</option><option>USDC wallet</option></select></label>
@@ -813,6 +1190,32 @@ function exportReport() {
 }
 
 function render() {
+  if (!authReady) {
+    root.innerHTML = `<div class="boot"><span class="brand-mark">M</span><p>Opening M-Ledger workspace…</p></div>`;
+    return;
+  }
+
+  if (!currentUser) {
+    root.innerHTML = authPage();
+    root.querySelector<HTMLButtonElement>('#google-signin-btn')?.addEventListener('click', async () => {
+      authBusy = true;
+      authError = '';
+      render();
+      try {
+        await signInWithPopup(auth, googleProvider);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to sign in with Google.';
+        authError = message.includes('popup-closed-by-user')
+          ? 'Sign-in popup was closed before completion.'
+          : message;
+      } finally {
+        authBusy = false;
+        render();
+      }
+    });
+    return;
+  }
+
   root.innerHTML = shell(contentForPage());
   root.querySelectorAll<HTMLElement>('[data-page]').forEach(element => element.addEventListener('click', event => {
     event.preventDefault();
@@ -830,7 +1233,7 @@ function render() {
     if (action === 'new-beneficiary') openBeneficiaryModal();
     if (action === 'dismiss-notice') { notice = ''; render(); }
     if (action === 'notifications') {
-      notice = localStorage.getItem('mledger.notifications') === 'false' ? 'There are no new notifications.' : 'You’re all caught up.';
+      notice = !userNotifications ? 'There are no new notifications.' : 'You’re all caught up.';
       render();
     }
     if (action === 'quick-payout') {
@@ -902,8 +1305,9 @@ function render() {
     const to = String(formData.get('to'));
     await callTool('mledger_estimate_fx', { amount, from, to });
   });
-  root.querySelector<HTMLFormElement>('#settings-form')?.addEventListener('submit', event => {
+  root.querySelector<HTMLFormElement>('#settings-form')?.addEventListener('submit', async event => {
     event.preventDefault();
+    if (!currentUser) return;
     const formData = new FormData(event.currentTarget as HTMLFormElement);
     const organization = String(formData.get('organization')).trim();
     if (!organization) {
@@ -911,10 +1315,27 @@ function render() {
       render();
       return;
     }
-    localStorage.setItem('mledger.org', organization);
-    localStorage.setItem('mledger.notifications', String(formData.has('notifications')));
-    notice = 'Workspace settings saved.';
-    render();
+    const notificationsEnabled = formData.has('notifications');
+    const uid = currentUser.uid;
+    const userPath = `users/${uid}`;
+    try {
+      await updateDoc(doc(db, 'users', uid), {
+        organization,
+        notificationsEnabled,
+        updatedAt: serverTimestamp(),
+      });
+      userOrganization = organization;
+      userNotifications = notificationsEnabled;
+      localStorage.setItem('mledger.org', organization);
+      localStorage.setItem('mledger.notifications', String(notificationsEnabled));
+      notice = 'Workspace settings saved to Firestore.';
+      render();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, userPath);
+    }
+  });
+  root.querySelector('#signout-btn')?.addEventListener('click', async () => {
+    await signOut(auth);
   });
   root.querySelector('#menu-toggle')?.addEventListener('click', () => {
     root.querySelector('.sidebar')?.classList.toggle('sidebar-open');
@@ -934,6 +1355,36 @@ app.onerror = (error: any) => {
   render();
 };
 
+onAuthStateChanged(auth, async user => {
+  currentUser = user;
+  authReady = true;
+  if (!user) {
+    clearFirestoreListeners();
+    backendVerified = false;
+    data = structuredClone(sample);
+    cloudBeneficiaries = [];
+    render();
+    return;
+  }
+
+  render();
+  try {
+    await securedBackendFetch('/api/session');
+    backendVerified = true;
+  } catch (error) {
+    backendVerified = false;
+    notice = error instanceof Error ? error.message : 'Backend token verification failed.';
+  }
+
+  try {
+    await ensureUserWorkspace(user);
+    startFirestoreSync(user.uid);
+  } catch (error) {
+    notice = error instanceof Error ? error.message : 'Unable to connect to Cloud Firestore.';
+  }
+  render();
+});
+
 render();
 app.connect()
   .then(async () => {
@@ -943,6 +1394,4 @@ app.connect()
   })
   .catch(() => {
     connection = 'preview';
-    notice = notice || 'Static sandbox preview: changes are saved in this browser only.';
-    render();
   });

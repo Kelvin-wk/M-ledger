@@ -1,0 +1,215 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny all reads and writes
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global hardened primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isCurrency(val) {
+      return val is string && val.size() >= 3 && val.size() <= 4 && val in ['KES', 'USD', 'USDC'];
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'organization', 'notificationsEnabled', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'organization', 'notificationsEnabled', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid == request.auth.uid && data.uid == userId
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+        && data.organization is string && data.organization.size() >= 1 && data.organization.size() <= 80
+        && data.notificationsEnabled is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data, userId) {
+      return data.keys().hasAll(['ownerId', 'reference', 'customer', 'description', 'amount', 'currency', 'dueDate', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'reference', 'customer', 'description', 'amount', 'currency', 'dueDate', 'status', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid && data.ownerId == userId
+        && data.reference is string && data.reference.size() >= 3 && data.reference.size() <= 40
+        && data.customer is string && data.customer.size() >= 2 && data.customer.size() <= 100
+        && data.description is string && data.description.size() >= 3 && data.description.size() <= 180
+        && (data.amount is int || data.amount is float) && data.amount > 0 && data.amount <= 1000000000
+        && isCurrency(data.currency)
+        && data.dueDate is string && data.dueDate.size() == 10 && data.dueDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && data.status is string && data.status.size() >= 4 && data.status.size() <= 20 && data.status in ['open', 'partially_settled', 'settled']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSettlement(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'invoiceId', 'amount', 'sourceCurrency', 'destinationCurrency',
+          'destination', 'rail', 'status', 'idempotencyKey', 'note',
+          'confirmationToken', 'attestationHash', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'invoiceId', 'amount', 'sourceCurrency', 'destinationCurrency',
+          'destination', 'rail', 'status', 'idempotencyKey', 'note',
+          'confirmationToken', 'attestationHash', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid && data.ownerId == userId
+        && isValidId(data.invoiceId)
+        && (data.amount is int || data.amount is float) && data.amount > 0 && data.amount <= 1000000000
+        && isCurrency(data.sourceCurrency)
+        && isCurrency(data.destinationCurrency)
+        && data.destination is string && data.destination.size() >= 5 && data.destination.size() <= 120
+        && data.rail is string && data.rail.size() >= 8 && data.rail.size() <= 24 && data.rail in ['mpesa_sandbox', 'bank_sandbox', 'stablecoin_sandbox']
+        && data.status is string && data.status.size() >= 6 && data.status.size() <= 24 && data.status in ['pending_confirmation', 'processing', 'completed', 'failed']
+        && data.idempotencyKey is string && data.idempotencyKey.size() >= 8 && data.idempotencyKey.size() <= 80
+        && data.note is string && data.note.size() >= 1 && data.note.size() <= 200
+        && data.confirmationToken is string && data.confirmationToken.size() >= 8 && data.confirmationToken.size() <= 128
+        && data.attestationHash is string && data.attestationHash.size() >= 16 && data.attestationHash.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBeneficiary(data, userId) {
+      return data.keys().hasAll(['ownerId', 'name', 'country', 'rail', 'destination', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'country', 'rail', 'destination', 'createdAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid && data.ownerId == userId
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 100
+        && data.country is string && data.country.size() >= 2 && data.country.size() <= 80
+        && data.rail is string && data.rail.size() >= 5 && data.rail.size() <= 20 && data.rail in ['M-Pesa', 'Bank transfer', 'USDC wallet']
+        && data.destination is string && data.destination.size() >= 5 && data.destination.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data, userId) {
+      return data.keys().hasAll(['ownerId', 'action', 'targetId', 'attestationHash', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'action', 'targetId', 'attestationHash', 'createdAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid && data.ownerId == userId
+        && data.action is string && data.action.size() >= 2 && data.action.size() <= 60
+        && isValidId(data.targetId)
+        && data.attestationHash is string && data.attestationHash.size() >= 16 && data.attestationHash.size() <= 128
+        && data.createdAt is timestamp;
+    }
+
+    // User profile & PII isolation (no blanket reads, no list)
+    match /users/{userId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['organization', 'notificationsEnabled', 'updatedAt']);
+      allow delete: if false;
+
+      // Invoices subcollection
+      match /invoices/{invoiceId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(invoiceId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(invoiceId)
+          && isValidInvoice(incoming(), userId)
+          && incoming().status == 'open'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(invoiceId)
+          && isValidInvoice(incoming(), userId)
+          && existing().status != 'settled'
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      // Settlements subcollection
+      match /settlements/{settlementId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(settlementId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(settlementId)
+          && isValidSettlement(incoming(), userId)
+          && incoming().status == 'pending_confirmation'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && exists(/databases/$(database)/documents/users/$(userId)/invoices/$(incoming().invoiceId))
+          && get(/databases/$(database)/documents/users/$(userId)/invoices/$(incoming().invoiceId)).data.ownerId == request.auth.uid;
+        allow update: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(settlementId)
+          && isValidSettlement(incoming(), userId)
+          && !(existing().status in ['completed', 'failed'])
+          && incoming().ownerId == existing().ownerId
+          && incoming().invoiceId == existing().invoiceId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'note', 'attestationHash', 'updatedAt'])
+          && incoming().status in ['completed', 'failed'];
+        allow delete: if false;
+      }
+
+      // Beneficiaries subcollection
+      match /beneficiaries/{beneficiaryId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(beneficiaryId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(beneficiaryId)
+          && isValidBeneficiary(incoming(), userId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if false;
+        allow delete: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(beneficiaryId)
+          && existing().ownerId == request.auth.uid;
+      }
+
+      // Append-only Audit Logs subcollection
+      match /auditLogs/{logId} {
+        allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(logId)
+          && existing().ownerId == request.auth.uid;
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(logId)
+          && isValidAuditLog(incoming(), userId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+        allow update, delete: if false;
+      }
+    }
+  }
+}
