@@ -43,6 +43,12 @@ The MCP endpoint defaults to `http://127.0.0.1:3001/mcp`; health check: `http://
 The current starter exposes Streamable HTTP. A stdio adapter can be added for hosts that launch local MCP processes.
 `npm run build` also compiles the Solidity registry and writes its ABI and bytecode to `dist/contracts/MLedgerSettlementRegistry.json`.
 
+## Host the dashboard on Vercel
+
+Import the GitHub repository into Vercel and deploy with the included `vercel.json`. Vercel runs `npm run build`, publishes `dist`, and serves the dashboard at `/`. No environment variables are required for the static sandbox preview.
+
+The hosted preview uses sample data and keeps invoices, sandbox settlement simulations and beneficiary preferences in that visitor's browser storage. Preview changes are not shared across browsers or connected to the MCP server, a blockchain, or a payment provider. To use the MCP backend, host it separately and open the UI from an MCP-compatible host.
+
 ## MCP tool contract
 
 | Tool | Purpose | Writes? |

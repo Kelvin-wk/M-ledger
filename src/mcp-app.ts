@@ -24,6 +24,7 @@ type Settlement = {
   status: string;
   createdAt: string;
   note: string;
+  confirmationToken?: string;
 };
 type Data = {
   summary: {
@@ -84,11 +85,39 @@ const sample: Data = {
   settlements: [],
 };
 
-let data: Data = sample;
+let storageWarning = '';
+function readLocalData(): Data {
+  try {
+    const stored = localStorage.getItem('mledger.preview-ledger');
+    if (!stored) return structuredClone(sample);
+    const parsed: unknown = JSON.parse(stored);
+    if (
+      typeof parsed === 'object'
+      && parsed !== null
+      && 'invoices' in parsed
+      && 'settlements' in parsed
+      && Array.isArray(parsed.invoices)
+      && Array.isArray(parsed.settlements)
+    ) {
+      return parsed as Data;
+    }
+    if (stored) {
+      localStorage.removeItem('mledger.preview-ledger');
+      storageWarning = 'Saved preview data was invalid and has been reset to the sample ledger.';
+    }
+  } catch (error) {
+    storageWarning = error instanceof Error
+      ? `Saved preview data could not be loaded: ${error.message}`
+      : 'Saved preview data could not be loaded.';
+  }
+  return structuredClone(sample);
+}
+
+let data: Data = readLocalData();
 let busy = false;
-let notice = '';
+let notice = storageWarning;
 let activePage: Page = 'dashboard';
-let connection: 'connecting' | 'connected' | 'preview' | 'offline' = 'connecting';
+let connection: 'connected' | 'preview' | 'offline' = 'preview';
 let invoiceSearch = '';
 let invoiceStatus = 'all';
 let settlementStatus = 'all';
@@ -120,7 +149,137 @@ const parseResult = (result: any): any => {
   try { return typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return null; }
 };
 
+function recalculateLocalSummary() {
+  const remaining = (invoice: Invoice) => invoice.amount - data.settlements
+    .filter(item => item.invoiceId === invoice.id && item.status === 'completed')
+    .reduce((sum, item) => sum + item.amount, 0);
+  data.summary = {
+    invoiceCount: data.invoices.length,
+    openCount: data.invoices.filter(invoice => invoice.status !== 'settled').length,
+    settlementCount: data.settlements.length,
+    completedCount: data.settlements.filter(item => item.status === 'completed').length,
+    pendingCount: data.settlements.filter(item => item.status === 'pending_confirmation' || item.status === 'processing').length,
+    totalKES: data.invoices.filter(invoice => invoice.currency === 'KES')
+      .reduce((sum, invoice) => sum + Math.max(0, remaining(invoice)), 0),
+    totalUSD: data.invoices.filter(invoice => invoice.currency !== 'KES')
+      .reduce((sum, invoice) => sum + Math.max(0, remaining(invoice)), 0),
+    sandbox: true,
+  };
+}
+function saveLocalData() {
+  recalculateLocalSummary();
+  localStorage.setItem('mledger.preview-ledger', JSON.stringify(data));
+}
+function validCurrency(value: unknown): value is Currency {
+  return value === 'KES' || value === 'USD' || value === 'USDC';
+}
+function localTool(name: string, args: Record<string, unknown>) {
+  let result: Record<string, any>;
+  if (name === 'mledger_create_invoice') {
+    const reference = String(args.reference ?? '').trim();
+    const customer = String(args.customer ?? '').trim();
+    const description = String(args.description ?? '').trim();
+    const amount = Number(args.amount);
+    const currency = args.currency;
+    const dueDate = String(args.dueDate ?? '');
+    if (reference.length < 3 || reference.length > 40) throw new Error('Invoice reference must contain 3–40 characters.');
+    if (data.invoices.some(invoice => invoice.reference.toLowerCase() === reference.toLowerCase())) throw new Error('Invoice reference already exists.');
+    if (customer.length < 2 || customer.length > 100) throw new Error('Customer name must contain 2–100 characters.');
+    if (description.length < 3 || description.length > 180) throw new Error('Description must contain 3–180 characters.');
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000) throw new Error('Amount must be greater than zero and within the supported limit.');
+    if (!validCurrency(currency)) throw new Error('Choose a supported currency.');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(Date.parse(`${dueDate}T00:00:00`))) throw new Error('Choose a valid due date.');
+    const invoice: Invoice = {
+      id: crypto.randomUUID(), reference, customer, description, amount, currency, dueDate,
+      status: 'open', createdAt: new Date().toISOString(),
+    };
+    data.invoices.unshift(invoice);
+    saveLocalData();
+    result = { invoice, sandbox: true };
+  } else if (name === 'mledger_request_settlement') {
+    const invoice = data.invoices.find(item => item.id === args.invoiceId);
+    if (!invoice) throw new Error('Invoice not found.');
+    const amount = Number(args.amount);
+    const reserved = data.settlements.filter(item => item.invoiceId === invoice.id && item.status !== 'failed')
+      .reduce((sum, item) => sum + item.amount, 0);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > invoice.amount - reserved) throw new Error('Settlement amount must be positive and cannot exceed the remaining invoice balance.');
+    if (args.sourceCurrency !== invoice.currency) throw new Error('Settlement source currency must match the invoice currency.');
+    const destination = String(args.destination ?? '').trim();
+    if (destination.length < 5 || destination.length > 120) throw new Error('Destination must contain 5–120 characters.');
+    const rails: Record<string, string> = {
+      mpesa_sandbox: 'M-Pesa sandbox',
+      bank_sandbox: 'Bank sandbox',
+      stablecoin_sandbox: 'Stablecoin sandbox',
+    };
+    if (typeof args.rail !== 'string' || !rails[args.rail]) throw new Error('Choose a supported sandbox settlement rail.');
+    const settlement: Settlement = {
+      id: crypto.randomUUID(),
+      invoiceId: invoice.id,
+      amount: Math.round(amount * 100) / 100,
+      sourceCurrency: invoice.currency,
+      destinationCurrency: validCurrency(args.destinationCurrency) ? args.destinationCurrency : 'KES',
+      destination,
+      rail: args.rail,
+      status: 'pending_confirmation',
+      createdAt: new Date().toISOString(),
+      note: 'Sandbox only. No funds have moved.',
+      confirmationToken: crypto.randomUUID(),
+    };
+    data.settlements.unshift(settlement);
+    saveLocalData();
+    result = { settlement, sandbox: true };
+  } else if (name === 'mledger_get_confirmation_challenge') {
+    const settlement = data.settlements.find(item => item.id === args.settlementId && item.status === 'pending_confirmation');
+    if (!settlement?.confirmationToken) throw new Error('No pending settlement found.');
+    result = { settlementId: settlement.id, confirmationToken: settlement.confirmationToken };
+  } else if (name === 'mledger_confirm_settlement') {
+    const settlement = data.settlements.find(item => item.id === args.settlementId);
+    if (!settlement) throw new Error('Settlement not found.');
+    if (settlement.status === 'completed') {
+      result = { settlement, sandbox: true };
+    } else {
+      if (settlement.status !== 'pending_confirmation') throw new Error('Settlement is no longer pending confirmation.');
+      if (args.confirmed !== true) throw new Error('Explicit confirmation is required.');
+      if (!settlement.confirmationToken || args.confirmationToken !== settlement.confirmationToken) throw new Error('Invalid settlement confirmation token.');
+      settlement.status = 'completed';
+      settlement.note = 'Sandbox settlement completed. This is a simulated ledger entry; no funds moved.';
+      const invoice = data.invoices.find(item => item.id === settlement.invoiceId);
+      if (invoice) {
+        const total = data.settlements.filter(item => item.invoiceId === invoice.id && item.status === 'completed')
+          .reduce((sum, item) => sum + item.amount, 0);
+        invoice.status = total >= invoice.amount ? 'settled' : 'partially_settled';
+      }
+      saveLocalData();
+      result = { settlement, sandbox: true };
+    }
+  } else if (name === 'mledger_estimate_fx') {
+    const amount = Number(args.amount);
+    const from = args.from;
+    const to = args.to;
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000) throw new Error('Amount must be positive and within the supported limit.');
+    if (!validCurrency(from) || !validCurrency(to)) throw new Error('Choose supported currencies.');
+    const kesPerUsd = 129.5;
+    const usd = from === 'KES' ? amount / kesPerUsd : amount;
+    const outputAmount = to === 'KES' ? usd * kesPerUsd : usd;
+    result = {
+      inputAmount: Math.round(amount * 100) / 100,
+      from,
+      outputAmount: Math.round(outputAmount * 100) / 100,
+      to,
+      rateLabel: 'Illustrative demo rate · not executable',
+      disclaimer: 'Indicative only. Confirm live rates and fees with your regulated provider.',
+    };
+  } else {
+    throw new Error(`The ${name} operation is unavailable in the static preview.`);
+  }
+  return {
+    structuredContent: result,
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+  };
+}
+
 async function refresh() {
+  if (connection !== 'connected') return;
   try {
     const response = await app.callServerTool({ name: 'mledger_dashboard', arguments: {} });
     const next = parseResult(response);
@@ -137,7 +296,9 @@ async function callTool(name: string, args: Record<string, unknown> = {}) {
   notice = '';
   if (!modalOpen) render();
   try {
-    const response = await app.callServerTool({ name, arguments: args });
+    const response = connection === 'connected'
+      ? await app.callServerTool({ name, arguments: args })
+      : localTool(name, args);
     const parsed = parseResult(response);
     if (!parsed) throw new Error('The server returned an unreadable response.');
     if (parsed.error) {
@@ -232,7 +393,7 @@ function invoiceRows(invoices: Invoice[]) {
     <td><b>${safe(invoice.reference)}</b><small>${safe(invoice.description)}</small></td>
     <td>${safe(invoice.customer)}</td><td class="amount">${money(invoice.amount, invoice.currency)}</td>
     <td>${shortDate(invoice.dueDate)}</td><td>${badge(invoice.status)}</td>
-    <td><button class="text-action" data-settle="${safe(invoice.id)}" ${invoice.id.startsWith('demo-') || invoiceBalance(invoice) <= 0 ? 'disabled title="Connect to the M-Ledger server and use a live ledger invoice"' : ''}>Request payout →</button></td>
+    <td><button class="text-action" data-settle="${safe(invoice.id)}" ${connection === 'connected' && invoice.id.startsWith('demo-') || invoiceBalance(invoice) <= 0 ? 'disabled title="This invoice has no available settlement balance"' : ''}>Request payout →</button></td>
   </tr>`).join('');
 }
 function invoiceTable(invoices: Invoice[], includeFilters = false) {
@@ -477,11 +638,11 @@ function apiPage() {
   const tools = ['mledger_dashboard', 'mledger_list_invoices', 'mledger_create_invoice', 'mledger_estimate_fx', 'mledger_request_settlement', 'mledger_list_settlements'];
   return `<div class="page-intro"><h2>API & MCP</h2><p>Connect an MCP-compatible host to the sandbox settlement workspace.</p></div>
     <section class="panel">${panelHeader('MCP endpoint', 'Streamable HTTP · local sandbox', '<button class="secondary small" data-copy="${safe(endpoint)}">Copy URL</button>')}
-      <div class="code-block">${safe(endpoint)}</div><div class="api-meta"><span>Connection <b class="${connection === 'connected' ? 'text-green' : ''}">${connection === 'connected' ? 'Connected to MCP host' : connection === 'preview' ? 'Browser preview · not connected' : connection === 'offline' ? 'Disconnected' : 'Connecting…'}</b></span><span>Health check <code>${safe(location.origin)}/health</code></span></div>
+      <div class="code-block">${safe(endpoint)}</div><div class="api-meta"><span>Connection <b class="${connection === 'connected' ? 'text-green' : ''}">${connection === 'connected' ? 'Connected to MCP host' : connection === 'preview' ? 'Static preview · actions stay in this browser' : 'Disconnected'}</b></span><span>${connection === 'connected' ? `Health check <code>${safe(location.origin)}/health</code>` : 'A separately hosted backend is required for MCP tools.'}</span></div>
     </section>
-    <section class="panel">${panelHeader('Available MCP tools', 'Read and write operations for the demo ledger')}
+    <section class="panel">${panelHeader('Available MCP tools', 'Read and write operations when opened in an MCP host')}
       <div class="tool-list">${tools.map(tool => `<div><code>${tool}</code><span>${tool.includes('create') || tool.includes('request') ? 'Sandbox write' : 'Read / estimate'}</span></div>`).join('')}</div>
-      <div class="notice info-notice">Settlement confirmation is gated in the app UI and updates only the in-memory sandbox ledger. This server cannot transfer money.</div>
+      <div class="notice info-notice">${connection === 'connected' ? 'Settlement confirmation is gated in the app UI and updates only the sandbox ledger. This server cannot transfer money.' : 'Static preview actions are stored in this browser only. They are not sent to an MCP server and cannot transfer money.'}</div>
     </section>`;
 }
 function settingsPage() {
@@ -490,7 +651,7 @@ function settingsPage() {
   return `<section class="panel settings-panel">${panelHeader('Workspace settings', 'Manage local preview preferences')}
     <form id="settings-form" class="settings-form"><label>Organization name<input name="organization" value="${organization}" maxlength="80" required></label>
       <label class="setting-switch"><span><b>Settlement notifications</b><small>Show local activity notices in this workspace.</small></span><input name="notifications" type="checkbox" ${notifications ? 'checked' : ''}></label>
-      <div class="setting-readonly"><span>Workspace mode</span><b>Sandbox · no real funds</b></div><div class="setting-readonly"><span>Data storage</span><b>In-memory server / local browser preferences</b></div>
+      <div class="setting-readonly"><span>Workspace mode</span><b>Sandbox · no real funds</b></div>      <div class="setting-readonly"><span>Data storage</span><b>${connection === 'connected' ? 'In-memory MCP server' : 'Browser local storage · this device'}</b></div>
       <button class="primary" type="submit">Save settings</button></form>
   </section><div class="notice info-notice">Organization name and notification preference are saved in this browser only. Payment provider credentials are not configured here.</div>`;
 }
@@ -616,11 +777,7 @@ function confirmationDialog(settlement: Settlement) {
     control.disabled = true;
     control.textContent = 'Confirming…';
     try {
-      const challengeResponse = await app.callServerTool({
-        name: 'mledger_get_confirmation_challenge',
-        arguments: { settlementId: settlement.id },
-      });
-      const challenge = parseResult(challengeResponse);
+      const challenge = await callTool('mledger_get_confirmation_challenge', { settlementId: settlement.id });
       if (!challenge?.confirmationToken) throw new Error(challenge?.error ?? 'Unable to obtain a valid confirmation challenge.');
       closeModal();
       await callTool('mledger_confirm_settlement', {
@@ -677,11 +834,10 @@ function render() {
       render();
     }
     if (action === 'quick-payout') {
-      const invoice = data.invoices.find(item => !item.id.startsWith('demo-') && invoiceBalance(item) > 0);
+      const invoice = data.invoices.find(item => (connection !== 'connected' || !item.id.startsWith('demo-')) && invoiceBalance(item) > 0);
       if (invoice) openSettlementModal(invoice);
       else {
-        notice = 'Create an invoice in the connected sandbox ledger before requesting a payout.';
-        render();
+        notice = 'Create an invoice before requesting a sandbox payout.';
         activePage = 'invoices';
         render();
       }
@@ -700,7 +856,7 @@ function render() {
   }));
   root.querySelectorAll<HTMLElement>('[data-settle]').forEach(element => element.addEventListener('click', () => {
     const invoice = data.invoices.find(item => item.id === element.dataset.settle);
-    if (invoice && !invoice.id.startsWith('demo-')) openSettlementModal(invoice);
+    if (invoice && (connection !== 'connected' || !invoice.id.startsWith('demo-'))) openSettlementModal(invoice);
   }));
   root.querySelectorAll<HTMLElement>('[data-confirm]').forEach(element => element.addEventListener('click', () => {
     const settlement = data.settlements.find(item => item.id === element.dataset.confirm);
@@ -787,5 +943,6 @@ app.connect()
   })
   .catch(() => {
     connection = 'preview';
+    notice = notice || 'Static sandbox preview: changes are saved in this browser only.';
     render();
   });
